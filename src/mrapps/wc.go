@@ -6,7 +6,7 @@ package main
 // go build -buildmode=plugin wc.go
 //
 
-import "../mr"
+import "mit6824/src/mr"
 import "unicode"
 import "strings"
 import "strconv"
