@@ -1,33 +1,97 @@
 package mr
 
-import "log"
+import (
+	"errors"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+)
 import "net"
 import "os"
 import "net/rpc"
 import "net/http"
 
 type Master struct {
-	// Your definitions here.
-
+	// map slaver名称与信息的映射关系
+	mapSlavers map[string]*Slaver
+	// reduce slaver名称与信息的映射关系
+	reduceSlavers map[string]*Slaver
+	// map slaver名称
+	mapSlaverNames []string
+	// reduce slaver名称
+	reduceSlaverNames []string
+	// 待指派Map任务队列
+	unAssignMapTaskChan chan *Task
+	// 待指派Reduce任务队列
+	unAssignReduceTaskChan chan *Task
+	// map任务完成队列
+	mapTaskDoneChan chan *TaskProcessInfo
+	// reduce任务完成队列
+	reduceTaskDoneChan chan *TaskProcessInfo
+	// map任务失败队列
+	mapTaskFailChan chan *TaskProcessInfo
+	// reduce任务失败队列
+	reduceTaskFailChan chan *TaskProcessInfo
+	// 用于生成任务id
+	GlobalTaskId int
+	// map任务结束后生成的分片数
+	pieceNum int
+	lock     sync.Mutex
+	// 执行中的maptask
+	unCompletedMapTask  map[int]struct{}
+	reduceSlaversPaused bool
 }
 
-// Your code here -- RPC handlers for the worker to call.
+type MasterServer struct {
+	master *Master
+}
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+func (m *Master) init() {
+	m.mapSlavers = make(map[string]*Slaver, 1)
+	m.reduceSlavers = make(map[string]*Slaver, 1)
+	m.unAssignMapTaskChan = make(chan *Task, 100)
+	m.unAssignReduceTaskChan = make(chan *Task, 100)
+	m.unCompletedMapTask = make(map[int]struct{})
+	m.mapTaskDoneChan = make(chan *TaskProcessInfo, 100)
+	m.reduceTaskDoneChan = make(chan *TaskProcessInfo, 100)
+	m.mapTaskFailChan = make(chan *TaskProcessInfo, 100)
+	m.reduceTaskFailChan = make(chan *TaskProcessInfo, 100)
+}
+
+// 心跳
+func (ms *MasterServer) HeartBeat(args *HeartBeatArgs, reply *HeartBeatReply) error {
+	reply.Alive = true
+	var slaver *Slaver
+	m := ms.master
+	// reduce
+	if _, ok := m.mapSlavers[args.Name]; !ok {
+		slaver = &Slaver{SlaverName: args.Name, State: AVALIABLE}
+		m.mapSlaverNames = append(m.mapSlaverNames, args.Name)
+	} else {
+		slaver = m.mapSlavers[args.Name]
+		slaver.State = AVALIABLE
+	}
+	slaver.LastActiveTm = time.Now().Unix()
+	m.mapSlavers[args.Name] = slaver
+	// map
+	if _, ok := m.reduceSlavers[args.Name]; !ok {
+		slaver = &Slaver{SlaverName: args.Name, State: AVALIABLE}
+		m.reduceSlaverNames = append(m.reduceSlaverNames, args.Name)
+	} else {
+		slaver = m.reduceSlavers[args.Name]
+		slaver.State = AVALIABLE
+	}
+	slaver.LastActiveTm = time.Now().Unix()
+	m.reduceSlavers[args.Name] = slaver
 	return nil
 }
 
 //
 // start a thread that listens for RPCs from worker.go
 //
-func (m *Master) server() {
-	rpc.Register(m)
+func (ms *MasterServer) server() {
+	rpc.Register(ms)
 	rpc.HandleHTTP()
 	//l, e := net.Listen("tcp", ":1234")
 	sockname := masterSock()
@@ -44,11 +108,7 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
-
-	// Your code here.
-
-	return ret
+	return false
 }
 
 //
@@ -57,10 +117,398 @@ func (m *Master) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{}
+	m := &Master{}
+	ms := &MasterServer{
+		master: m,
+	}
+	// 初始化
+	m.init()
+	// 设置reduce切片数
+	m.pieceNum = nReduce
+	// 启动rpc server
+	ms.server()
+	// 校验worker是否存活
+	go m.checkAndCleanSlaverAlive()
+	// 分配map任务
+	go m.assignMapTask()
+	// 分配reduce任务
+	go m.assignReduceTask()
+	// 处理map任务完成请求
+	go m.mapTaskCompleted()
+	// 处理reduce完成请求
+	go m.reduceTaskCompleted()
+	// 将任务导入unAssignMapTaskChan中等待分配
+	fmt.Println("开始分配Map任务")
+	for i, _ := range files {
+		task := m.generateMapTask(files[i])
+		m.unCompletedMapTask[task.TaskMeta.TaskId] = struct{}{}
+		m.unAssignMapTaskChan <- task
 
-	// Your code here.
+		fmt.Println(len(m.unAssignMapTaskChan))
+	}
+	fmt.Println("开始分配Reduce任务")
+	for i := 0; i < m.pieceNum; i++ {
+		m.unAssignReduceTaskChan <- m.generateReduceTask(i)
+	}
+	return m
+}
 
-	m.server()
-	return &m
+// slaver完成任务时调用的接口
+func (ms *MasterServer) TaskCompleted(args *TaskProcessInfo, reply *TaskProcessReply) error {
+	m := ms.master
+	if args.TaskMeta.TaskType == MAP_TASK {
+		m.mapTaskDoneChan <- args
+	} else if args.TaskMeta.TaskType == REDUCE_TASK {
+		m.reduceTaskDoneChan <- args
+	} else {
+		fmt.Println("不能识别任务类型")
+		return errors.New("不能识别任务类型")
+	}
+	return nil
+}
+
+// map任务完成
+func (m *Master) mapTaskCompleted() error {
+	for {
+		select {
+		case taskProcessInfo := <-m.mapTaskDoneChan:
+			if taskProcessInfo.TaskMeta.TaskState == COMPLETE {
+				// 获取slaver注册的信息
+				slaver := m.mapSlavers[taskProcessInfo.SlaverName]
+				// 将任务从执行中列表表移到已完成队列中
+				slaver.moveTaskToCompletedTask(taskProcessInfo.TaskMeta.TaskId)
+				// 从未完成map中删除
+				delete(m.unCompletedMapTask, taskProcessInfo.TaskMeta.TaskId)
+				if len(m.unCompletedMapTask) == 0 {
+					// unpause
+					m.unPauseSlavers(m.reduceSlavers)
+				}
+			}
+		}
+	}
+}
+
+// reduce任务完成
+func (m *Master) reduceTaskCompleted() error {
+	for {
+		select {
+		case taskProcessInfo := <-m.reduceTaskDoneChan:
+			if taskProcessInfo.TaskMeta.TaskState == COMPLETE {
+				// 获取slaver注册的信息
+				slaver := m.reduceSlavers[taskProcessInfo.SlaverName]
+				// 将任务从执行中列表表移到已完成队列中
+				slaver.moveTaskToCompletedTask(taskProcessInfo.TaskMeta.TaskId)
+			}
+		}
+	}
+}
+
+// task执行失败
+func (ms *MasterServer) TaskFail(args *TaskProcessInfo, reply *TaskProcessReply) error {
+	m := ms.master
+	if args.TaskMeta.TaskType == MAP_TASK {
+		m.mapTaskFailChan <- args
+	} else if args.TaskMeta.TaskType == REDUCE_TASK {
+		m.reduceTaskFailChan <- args
+	} else {
+		fmt.Println("不能识别任务类型")
+		return errors.New("不能识别任务类型")
+	}
+	return nil
+}
+
+// map任务失败
+func (m *Master) mapTaskFail() error {
+	for {
+		select {
+		case taskProcessInfo := <-m.mapTaskFailChan:
+			if taskProcessInfo.TaskMeta.TaskState == FAILED {
+				// 获取slaver注册的信息
+				slaver := m.mapSlavers[taskProcessInfo.SlaverName]
+				// 将任务从执行中类表弹出
+				task := slaver.popTaskToReadyTask(taskProcessInfo.TaskMeta.TaskId)
+				m.unCompletedMapTask[task.TaskMeta.TaskId] = struct{}{}
+				// 重新指派
+				m.unAssignMapTaskChan <- task
+			}
+		}
+	}
+}
+
+// reduce任务失败
+func (m *Master) reduceTaskFail() error {
+	for {
+		select {
+		case taskProcessInfo := <-m.reduceTaskFailChan:
+			if taskProcessInfo.TaskMeta.TaskState == FAILED {
+				// 判断是否因为map访问失败导致的
+				if taskProcessInfo.TaskFailInfo != nil && taskProcessInfo.TaskFailInfo.FailReason == MAP_CRASH {
+					// 因为map slaver crash导致的任务失败
+					slaverName := taskProcessInfo.TaskFailInfo.SlaverName
+					if slaver, ok := m.mapSlavers[slaverName]; ok {
+						// 1.修改slaver的状态，防止别的reduce slaver上报相同异常导致重复处理
+						// 2.重新指派该map slaver上的所有map任务
+						m.unAvailableSlaver(slaver, true)
+						// 重新指派reduce任务
+						taskData := &TaskData{
+							Nu: taskProcessInfo.TaskFailInfo.PieceIndex,
+						}
+						task := &Task{
+							TaskMeta: taskProcessInfo.TaskMeta,
+							TaskData: []*TaskData{taskData},
+						}
+						m.unAssignReduceTaskChan <- task
+					}
+				}
+			}
+		}
+	}
+}
+
+// 指派mapTask
+func (m *Master) assignMapTask() {
+	for {
+		var task *Task
+		select {
+		case task = <-m.unAssignMapTaskChan:
+			slaver := m.getFreeMapSlaver()
+			fmt.Printf("assignMapTask,slaver=%v\n", slaver)
+			if slaver != nil {
+				// 将任务添加到slaver的processing task列表中
+				slaver.addProcessingTask(task)
+				// map slaver执行任务
+				err := slaver.executeTask(task)
+				fmt.Printf("调用执行任务成功，%v\n", err)
+				if err != nil {
+					// 重新加入未指派队列
+					m.unAssignMapTaskChan <- task
+					// 从slaver的执行中列表删除
+					slaver.deleteProcessingTask(task.TaskMeta.TaskId)
+				}
+			} else {
+				// 重新加入未指派队列
+				m.unAssignMapTaskChan <- task
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}
+}
+
+// 指派reduceTask
+func (m *Master) assignReduceTask() {
+	for {
+		var task *Task
+		select {
+		case task = <-m.unAssignReduceTaskChan:
+			for !m.isMapTaskAllDone() {
+				// map 任务还未完成继续等待
+				time.Sleep(1 * time.Second)
+				fmt.Println("等待map任务完成")
+			}
+			if m.reduceSlaversPaused {
+				m.unPauseSlavers(m.reduceSlavers)
+			}
+			slaver := m.getFreeReduceSlaver()
+			fmt.Printf("assignReduceTask,slaver=%v\n", slaver)
+			if slaver != nil {
+				slavers := make([]*Slaver, 0, len(m.mapSlavers))
+				for _, v := range m.mapSlavers {
+					slavers = append(slavers, v)
+				}
+				task.Slavers = slavers
+				// 将任务添加到slaver的processing task列表中
+				slaver.addProcessingTask(task)
+				// reduce slaver执行任务
+				err := slaver.executeTask(task)
+				fmt.Printf("调用执行任务成功，%v\n", err)
+				if err != nil {
+					// 重新加入未指派队列
+					m.unAssignReduceTaskChan <- task
+					// 从slaver的执行中列表删除
+					slaver.deleteProcessingTask(task.TaskMeta.TaskId)
+				}
+			} else {
+				// 重新加入未指派队列
+				m.unAssignReduceTaskChan <- task
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}
+}
+
+// 找到一个空闲的slaver
+func (m *Master) getFreeMapSlaver() *Slaver {
+	for i, _ := range m.mapSlaverNames {
+		slaver := m.mapSlavers[m.mapSlaverNames[i]]
+		if slaver.State == AVALIABLE && len(slaver.ProcessingTasks) == 0 {
+			return slaver
+		}
+	}
+	return nil
+}
+
+// 找到一个空闲的slaver
+func (m *Master) getFreeReduceSlaver() *Slaver {
+	for i, _ := range m.reduceSlaverNames {
+		slaver := m.reduceSlavers[m.reduceSlaverNames[i]]
+		if slaver.State == AVALIABLE && len(slaver.ProcessingTasks) == 0 {
+			return slaver
+		}
+	}
+	return nil
+}
+
+// 生成Map任务
+func (m *Master) generateMapTask(file string) *Task {
+	m.GlobalTaskId++
+	taskMeta := &TaskMeta{
+		TaskId:    m.GlobalTaskId,
+		TaskType:  MAP_TASK,
+		TaskState: READY,
+		PieceNum:  m.pieceNum,
+	}
+	taskData := make([]*TaskData, 0, 1)
+	taskData = append(taskData, &TaskData{
+		Str: file,
+	})
+	return &Task{
+		TaskMeta: taskMeta,
+		TaskData: taskData,
+	}
+
+}
+
+func (m *Master) checkAndCleanSlaverAlive() {
+	for {
+		select {
+		case <-time.NewTicker(time.Duration(3) * time.Second).C:
+			dropList := make([]*Slaver, 0)
+			for _, slaver := range m.mapSlavers {
+				// 9秒没有活动意味着worker已经挂了
+				if (time.Now().Unix() - slaver.LastActiveTm) > (9 * time.Second.Milliseconds()) {
+					fmt.Printf("slaver is dead, %v\n", slaver)
+					if slaver.State == DROP_ONLY {
+						dropList = append(dropList, slaver)
+					}
+					// 将slaver从列表中删除，并将任务状态加入待指派列表中
+					m.unAvailableSlaver(slaver, true)
+
+				}
+			}
+			m.dropMapSlavers(dropList)
+
+			dropList = dropList[0:0]
+			for _, slaver := range m.reduceSlavers {
+				// 9秒没有活动意味着worker已经挂了
+				if (time.Now().Unix() - slaver.LastActiveTm) > (9 * time.Second.Milliseconds()) {
+					fmt.Printf("slaver is dead, %v\n", slaver)
+					if slaver.State == DROP_ONLY {
+						dropList = append(dropList, slaver)
+					}
+					// 将slaver从列表中删除，并将任务状态加入待指派列表中
+					m.unAvailableSlaver(slaver, false)
+				}
+			}
+			m.dropReduceSlavers(dropList)
+		}
+	}
+}
+
+func (m *Master) unAvailableSlaver(slaver *Slaver, isTransferCompletedTask bool) {
+	slaver.lock.Lock()
+	defer slaver.lock.Unlock()
+	switch slaver.State {
+	case AVALIABLE:
+		// 将状态置为DROP_ONLY
+		slaver.State = DROP_ONLY
+	case DROP_ONLY:
+		// 迁移执行中的任务
+		for i, _ := range slaver.ProcessingTasks {
+			m.unCompletedMapTask[slaver.ProcessingTasks[i].TaskMeta.TaskId] = struct{}{}
+			m.unAssignMapTaskChan <- slaver.ProcessingTasks[i]
+		}
+		if isTransferCompletedTask {
+			// 如果是map则重新执行已完成的任务
+			for i, _ := range slaver.CompleteTasks {
+				m.unCompletedMapTask[slaver.CompleteTasks[i].TaskMeta.TaskId] = struct{}{}
+				m.unAssignMapTaskChan <- slaver.CompleteTasks[i]
+			}
+		}
+	}
+}
+
+func (m *Master) dropMapSlavers(list []*Slaver) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	for i, _ := range list {
+		delete(m.mapSlavers, list[i].SlaverName)
+		idx := -1
+		for j, _ := range m.mapSlaverNames {
+			if list[i].SlaverName == m.mapSlaverNames[j] {
+				idx = j
+			}
+		}
+		if idx >= 0 {
+			m.mapSlaverNames = append(m.mapSlaverNames[0:idx], m.mapSlaverNames[idx+1:]...)
+		}
+	}
+}
+
+func (m *Master) dropReduceSlavers(list []*Slaver) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	for i, _ := range list {
+		delete(m.reduceSlavers, list[i].SlaverName)
+		idx := -1
+		for j, _ := range m.reduceSlaverNames {
+			if list[i].SlaverName == m.reduceSlaverNames[j] {
+				idx = j
+			}
+		}
+		if idx >= 0 {
+			m.reduceSlaverNames = append(m.reduceSlaverNames[0:idx], m.reduceSlaverNames[idx+1:]...)
+		}
+	}
+}
+
+// 校验map任务是否全部完成
+func (m *Master) isMapTaskAllDone() bool {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	return len(m.unCompletedMapTask) == 0
+}
+
+func (m *Master) generateReduceTask(piece int) *Task {
+	m.GlobalTaskId++
+	taskMeta := &TaskMeta{
+		// 任务id
+		TaskId: m.GlobalTaskId,
+		// 任务类型
+		TaskType: REDUCE_TASK,
+		// 任务状态
+		TaskState: READY,
+	}
+	taskData := &TaskData{
+		Nu: piece,
+	}
+	return &Task{
+		TaskMeta: taskMeta,
+		TaskData: []*TaskData{taskData},
+	}
+}
+
+func (m *Master) unPauseSlavers(slavers map[string]*Slaver) error {
+	for i, _ := range slavers {
+		slaver := slavers[i]
+		args := &UnPauseArgs{}
+		reply := &UnPauseReply{}
+		ok := callWorker(slaver.SlaverName, SLAVER_UNPAUSE_REDUCE, args, reply)
+		if ok {
+			fmt.Println("解除pause成功")
+		} else {
+			fmt.Println("解除pause失败")
+			return errors.New("解除pause失败")
+		}
+	}
+	return nil
 }

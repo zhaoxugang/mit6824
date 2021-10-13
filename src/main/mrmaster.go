@@ -9,19 +9,41 @@ package main
 // Please do not change this file.
 //
 
-import "mit6824/src/mr"
+import (
+	"fmt"
+	"io/ioutil"
+	"mit6824/src/mr"
+	"os"
+)
 import "time"
-import "os"
-import "fmt"
 
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: mrmaster inputfiles...\n")
 		os.Exit(1)
 	}
-
-	m := mr.MakeMaster(os.Args[1:], 10)
+	//
+	//m := mr.MakeMaster(os.Args[1:], 10)
+	//for m.Done() == false {
+	//	time.Sleep(time.Second)
+	//}
+	//
+	//time.Sleep(time.Second)
+	dir := os.Args[1]
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+	filePaths := make([]string, 0)
+	for i, _ := range files {
+		if !files[i].IsDir() {
+			filePaths = append(filePaths, dir+"/"+files[i].Name())
+		}
+	}
+	m := mr.MakeMaster(filePaths, 10)
 	for m.Done() == false {
+		//fmt.Println("完了没")
 		time.Sleep(time.Second)
 	}
 
