@@ -32,7 +32,7 @@ const (
 	// 执行任务
 	SLAVER_EXECUTE_TASK     = "Slaver.RealExecuteTask"
 	SLAVER_FETCH_MAP_RESULT = "Slaver.FetchMapResult"
-	SLAVER_UNPAUSE_REDUCE   = "slaver.UnPauseReduce"
+	SLAVER_UNPAUSE_REDUCE   = "Slaver.UnPauseReduce"
 )
 
 type SlaverState int8

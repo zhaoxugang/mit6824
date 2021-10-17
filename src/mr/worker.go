@@ -4,10 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +50,8 @@ type Slaver struct {
 	mapf         func(string, string) []KeyValue
 	reducef      func(string, []string) string
 	intermediate [][]KeyValue
+	// 待执行任务管道
+	readyTaskChan chan *Task
 }
 
 //
@@ -58,6 +60,7 @@ type Slaver struct {
 func (s *Slaver) server() {
 	rpc.Register(s)
 	rpc.HandleHTTP()
+	fmt.Printf("start server,slaverName=%s\n", s.SlaverName)
 	sockname := slaverSock(s.SlaverName)
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
@@ -86,15 +89,23 @@ func (s *Slaver) executeTask(task *Task) error {
 }
 
 func (s *Slaver) RealExecuteTask(task *Task, reply *TaskProcessReply) error {
-	if task.TaskMeta.TaskType == MAP_TASK {
-		s.realExecuteMapTask(task)
-	} else if task.TaskMeta.TaskType == REDUCE_TASK {
-		s.realExecuteReduceTask(task)
-	} else {
-		fmt.Println("未知任务类型")
-	}
-
+	s.readyTaskChan <- task
 	return nil
+}
+
+func (s *Slaver) taskProcessor() {
+	for {
+		select {
+		case task := <-s.readyTaskChan:
+			if task.TaskMeta.TaskType == MAP_TASK {
+				s.realExecuteMapTask(task)
+			} else if task.TaskMeta.TaskType == REDUCE_TASK {
+				s.realExecuteReduceTask(task)
+			} else {
+				fmt.Println("未知任务类型")
+			}
+		}
+	}
 }
 
 func (s *Slaver) deleteProcessingTask(id int) {
@@ -145,7 +156,7 @@ func (s *Slaver) moveTaskToCompletedTask(id int) {
 }
 
 func (s *Slaver) realExecuteMapTask(task *Task) {
-	fmt.Println("realExecuteMapTask")
+	//fmt.Println("realExecuteMapTask")
 	defer func() {
 		if err := recover(); err != nil {
 			fmt.Println(err)
@@ -179,6 +190,7 @@ func (s *Slaver) realExecuteMapTask(task *Task) {
 			// todo 由master指定分片数
 			idx := ihash(kv.Key) % task.TaskMeta.PieceNum
 			if s.intermediate == nil {
+				fmt.Printf("task.TaskMeta.PieceNum=%d\n", task.TaskMeta.PieceNum)
 				s.intermediate = make([][]KeyValue, task.TaskMeta.PieceNum)
 			}
 			kvs := s.intermediate[idx]
@@ -201,7 +213,7 @@ func (s *Slaver) realExecuteReduceTask(task *Task) {
 	fmt.Println("realExecuteReduceTask")
 	defer func() {
 		if err := recover(); err != nil {
-			fmt.Println(err)
+			fmt.Printf("执行报错，err=%v\n", err)
 			// 调用处理master处理失败接口
 			task.TaskMeta.TaskState = FAILED
 			taskFailInfo := &TaskFailInfo{
@@ -217,6 +229,15 @@ func (s *Slaver) realExecuteReduceTask(task *Task) {
 			call(MASTER_TASK_FEIL, args, reply)
 		}
 	}()
+	fmt.Printf("reduce任务执行，%v", *task.TaskData[0])
+	oname := fmt.Sprintf("mr-out-%d", task.TaskData[0].Nu)
+	fmt.Printf("输出文件：%s\n", oname)
+	ofile, _ := os.Create(oname)
+	defer func() {
+		// 关闭文件
+		ofile.Sync()
+		ofile.Close()
+	}()
 	kvs, failReason := s.fetchIntermediateKv(task.TaskData[0].Nu, task.Slavers)
 	if failReason == SUCCESS {
 		kvalues := make(map[string][]string, 0)
@@ -225,8 +246,9 @@ func (s *Slaver) realExecuteReduceTask(task *Task) {
 			kvalues[k] = append(kvalues[k], kvs[i].Key)
 		}
 		for k, _ := range kvalues {
+			fmt.Printf("开始执行%s\n", k)
 			resultStr := s.reducef(k, kvalues[k])
-			fmt.Print(resultStr)
+			fmt.Fprintf(ofile, "%v %v\n", k, resultStr)
 		}
 		// 通知Master任务执行成功
 		task.TaskMeta.TaskState = COMPLETE
@@ -236,6 +258,9 @@ func (s *Slaver) realExecuteReduceTask(task *Task) {
 		}
 		reply := &TaskProcessReply{}
 		call(MASTER_TASK_COMPLETED, args, reply)
+		path, _ := filepath.Abs(ofile.Name())
+		fmt.Printf("reduce输出输出路径：%s\n", path)
+
 	} else {
 		// 调用处理master处理失败接口
 		task.TaskMeta.TaskState = FAILED
@@ -265,13 +290,13 @@ func (s *Slaver) popTaskToReadyTask(taskId int) *Task {
 		}
 	}
 	if task == nil {
-		fmt.Println("未在正在执行中列表中找到对应任务")
+		//fmt.Println("未在正在执行中列表中找到对应任务")
 		return nil
 	}
 	// 修改任务状态
 	ok := task.SetStateWithCondition(RUNNING, READY)
 	if !ok {
-		fmt.Println("修改任务状态失败")
+		//fmt.Println("修改任务状态失败")
 		return nil
 	} else {
 		return task
@@ -284,19 +309,26 @@ func (s *Slaver) popTaskToReadyTask(taskId int) *Task {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 	slaver := &Slaver{
-		SlaverName: generateName(),
-		mapf:       mapf,
-		reducef:    reducef,
+		SlaverName:    generateName(),
+		mapf:          mapf,
+		reducef:       reducef,
+		readyTaskChan: make(chan *Task, 100),
 	}
 	// 启动rpc服务
 	slaver.server()
+	// 启动map任务processor
+	go slaver.taskProcessor()
 	// 启动心跳
 	slaver.startHeartBeat()
 }
 
 func (s *Slaver) FetchMapResult(args *FetchMapResultArgs, reply *FetchMapResultReply) error {
 	pieceIdx := args.PieceIdx
-	reply.Kvs = s.intermediate[pieceIdx]
+	fmt.Printf("MAP:%d\n", len(s.intermediate))
+	if pieceIdx < len(s.intermediate) {
+		reply.Kvs = s.intermediate[pieceIdx]
+	}
+	fmt.Printf("Map返回的kvs：%v\n", reply.Kvs)
 	return nil
 }
 
@@ -323,13 +355,12 @@ func (s *Slaver) fetchIntermediateKv(pieceIdx int, slaverList []*Slaver) ([]KeyV
 }
 
 func generateName() string {
-	r := rand.New(rand.NewSource(time.Now().Unix()))
-	bytes := make([]byte, 8)
-	for i := 0; i < 8; i++ {
-		b := r.Intn(26) + 65
-		bytes[i] = byte(b)
-	}
-	return string(bytes)
+	f, _ := os.OpenFile("/dev/urandom", os.O_RDONLY, 0)
+	b := make([]byte, 16)
+	f.Read(b)
+	f.Close()
+	uuid := fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+	return string(uuid)
 }
 
 func (s *Slaver) startHeartBeat() {
@@ -348,14 +379,18 @@ func (s *Slaver) startHeartBeat() {
 }
 
 func (s *Slaver) callHeartBeat(args *HeartBeatArgs) *HeartBeatReply {
-
+	defer func() {
+		if e := recover(); e != nil {
+			fmt.Println("worker 心跳失败")
+		}
+	}()
 	reply := &HeartBeatReply{}
 	ok := call(MASTER_HEART_BEAT, args, reply)
 	if !ok {
 		fmt.Println("master is dead")
 	}
 	if reply.Alive {
-		fmt.Println("master is alive")
+		//fmt.Println("master is alive")
 	} else {
 		fmt.Println("master is dead")
 	}

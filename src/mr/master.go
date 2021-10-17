@@ -39,8 +39,10 @@ type Master struct {
 	pieceNum int
 	lock     sync.Mutex
 	// 执行中的maptask
-	unCompletedMapTask  map[int]struct{}
-	reduceSlaversPaused bool
+	unCompletedMapTask map[int]struct{}
+	// 执行中的reduceTask
+	unCompletedReduceTask map[int]struct{}
+	reduceSlaversPaused   bool
 }
 
 type MasterServer struct {
@@ -53,6 +55,7 @@ func (m *Master) init() {
 	m.unAssignMapTaskChan = make(chan *Task, 100)
 	m.unAssignReduceTaskChan = make(chan *Task, 100)
 	m.unCompletedMapTask = make(map[int]struct{})
+	m.unCompletedReduceTask = make(map[int]struct{})
 	m.mapTaskDoneChan = make(chan *TaskProcessInfo, 100)
 	m.reduceTaskDoneChan = make(chan *TaskProcessInfo, 100)
 	m.mapTaskFailChan = make(chan *TaskProcessInfo, 100)
@@ -68,22 +71,22 @@ func (ms *MasterServer) HeartBeat(args *HeartBeatArgs, reply *HeartBeatReply) er
 	if _, ok := m.mapSlavers[args.Name]; !ok {
 		slaver = &Slaver{SlaverName: args.Name, State: AVALIABLE}
 		m.mapSlaverNames = append(m.mapSlaverNames, args.Name)
+		m.addMapSlaver(slaver)
 	} else {
 		slaver = m.mapSlavers[args.Name]
 		slaver.State = AVALIABLE
 	}
 	slaver.LastActiveTm = time.Now().Unix()
-	m.mapSlavers[args.Name] = slaver
 	// map
 	if _, ok := m.reduceSlavers[args.Name]; !ok {
 		slaver = &Slaver{SlaverName: args.Name, State: AVALIABLE}
 		m.reduceSlaverNames = append(m.reduceSlaverNames, args.Name)
+		m.addReduceSlaver(slaver)
 	} else {
 		slaver = m.reduceSlavers[args.Name]
 		slaver.State = AVALIABLE
 	}
 	slaver.LastActiveTm = time.Now().Unix()
-	m.reduceSlavers[args.Name] = slaver
 	return nil
 }
 
@@ -108,7 +111,7 @@ func (ms *MasterServer) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	return false
+	return len(m.unAssignReduceTaskChan) == 0 && len(m.unCompletedMapTask) == 0
 }
 
 //
@@ -148,7 +151,9 @@ func MakeMaster(files []string, nReduce int) *Master {
 	}
 	fmt.Println("开始分配Reduce任务")
 	for i := 0; i < m.pieceNum; i++ {
-		m.unAssignReduceTaskChan <- m.generateReduceTask(i)
+		task := m.generateReduceTask(i)
+		m.addUnCompletedReduceTask(task.TaskMeta.TaskId)
+		m.unAssignReduceTaskChan <- task
 	}
 	return m
 }
@@ -181,6 +186,7 @@ func (m *Master) mapTaskCompleted() error {
 				delete(m.unCompletedMapTask, taskProcessInfo.TaskMeta.TaskId)
 				if len(m.unCompletedMapTask) == 0 {
 					// unpause
+					fmt.Println("UnPause1")
 					m.unPauseSlavers(m.reduceSlavers)
 				}
 			}
@@ -198,6 +204,8 @@ func (m *Master) reduceTaskCompleted() error {
 				slaver := m.reduceSlavers[taskProcessInfo.SlaverName]
 				// 将任务从执行中列表表移到已完成队列中
 				slaver.moveTaskToCompletedTask(taskProcessInfo.TaskMeta.TaskId)
+				// 将任务从未完成列表中删除
+				m.delUnCompletedReduceTask(taskProcessInfo.TaskMeta.TaskId)
 			}
 		}
 	}
@@ -272,7 +280,7 @@ func (m *Master) assignMapTask() {
 		select {
 		case task = <-m.unAssignMapTaskChan:
 			slaver := m.getFreeMapSlaver()
-			fmt.Printf("assignMapTask,slaver=%v\n", slaver)
+			//fmt.Printf("assignMapTask,slaver=%v\n", slaver)
 			if slaver != nil {
 				// 将任务添加到slaver的processing task列表中
 				slaver.addProcessingTask(task)
@@ -303,9 +311,10 @@ func (m *Master) assignReduceTask() {
 			for !m.isMapTaskAllDone() {
 				// map 任务还未完成继续等待
 				time.Sleep(1 * time.Second)
-				fmt.Println("等待map任务完成")
+				//fmt.Println("等待map任务完成")
 			}
 			if m.reduceSlaversPaused {
+				fmt.Println("Unpause2")
 				m.unPauseSlavers(m.reduceSlavers)
 			}
 			slaver := m.getFreeReduceSlaver()
@@ -511,4 +520,28 @@ func (m *Master) unPauseSlavers(slavers map[string]*Slaver) error {
 		}
 	}
 	return nil
+}
+
+func (m *Master) addUnCompletedReduceTask(taskId int) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	m.unCompletedReduceTask[taskId] = struct{}{}
+}
+
+func (m *Master) delUnCompletedReduceTask(taskId int) {
+	m.lock.Lock()
+	m.lock.Unlock()
+	delete(m.unCompletedReduceTask, taskId)
+}
+
+func (m *Master) addMapSlaver(slaver *Slaver) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	m.mapSlavers[slaver.SlaverName] = slaver
+}
+
+func (m *Master) addReduceSlaver(slaver *Slaver) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	m.reduceSlavers[slaver.SlaverName] = slaver
 }
