@@ -160,7 +160,8 @@ rm -f mr-out*
 echo '***' Starting crash test.
 
 rm -f mr-done
-(gtimeout -k 2s 180s ../mrmaster ../pg*txt ; touch mr-done ) &
+#(gtimeout -k 2s 180s ../mrmaster ../pg*txt ; touch mr-done ) &
+(../mrmaster ../pg*txt ; touch mr-done ) &
 sleep 1
 
 # start multiple workers

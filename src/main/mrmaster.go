@@ -17,6 +17,11 @@ import (
 )
 
 func main() {
+	defer func() {
+		if e := recover(); e != nil {
+			fmt.Printf("报错了,%v\n", e)
+		}
+	}()
 	if len(os.Args) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: mrmaster inputfiles...\n")
 		os.Exit(1)
@@ -26,8 +31,9 @@ func main() {
 	for m.Done() == false {
 		time.Sleep(time.Second)
 	}
-
+	fmt.Println("停止了。。。")
 	time.Sleep(time.Second)
+
 	//dir := os.Args[1]
 	//files, err := ioutil.ReadDir(dir)
 	//if err != nil {

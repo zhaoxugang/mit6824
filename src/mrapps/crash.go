@@ -8,7 +8,9 @@ package main
 // go build -buildmode=plugin crash.go
 //
 
-import "mit6824/src/mr"
+import (
+	"mit6824/src/mr"
+)
 import crand "crypto/rand"
 import "math/big"
 import "strings"

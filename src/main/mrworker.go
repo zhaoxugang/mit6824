@@ -23,8 +23,8 @@ func main() {
 	}
 
 	mapf, reducef := loadPlugin(os.Args[1])
-
 	mr.Worker(mapf, reducef)
+
 	//mr.Worker(mr.Map, mr.Reduce)
 }
 

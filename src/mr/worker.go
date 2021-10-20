@@ -1,18 +1,20 @@
 package mr
 
 import (
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 )
 import "log"
 import "net/rpc"
@@ -70,12 +72,21 @@ func (s *Slaver) server() {
 	go http.Serve(l, nil)
 }
 
-func (s *Slaver) executeTask(task *Task) error {
+func (s *Slaver) executeTask(task *Task) (err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			fmt.Printf("调度任务失败，taskId=%d\n", task.TaskMeta.TaskId)
+			task.SetStateWithCondition(RUNNING, READY)
+			err = errors.New("执行任务失败")
+		}
+	}()
 	if task.TaskMeta.TaskState == READY {
 		reply := &TaskProcessReply{}
 		// 设置任务状态为执行中
 		task.SetStateWithCondition(READY, RUNNING)
+		fmt.Println("开始调度===")
 		ok := callWorker(s.SlaverName, SLAVER_EXECUTE_TASK, task, reply)
+		fmt.Printf("结束调度===,%s\n", ok)
 		if ok {
 			return nil
 		} else {
@@ -100,6 +111,7 @@ func (s *Slaver) taskProcessor() {
 			if task.TaskMeta.TaskType == MAP_TASK {
 				s.realExecuteMapTask(task)
 			} else if task.TaskMeta.TaskType == REDUCE_TASK {
+				fmt.Printf("realExecuteReduceTask,taskId=%d\n", task.TaskMeta.TaskId)
 				s.realExecuteReduceTask(task)
 			} else {
 				fmt.Println("未知任务类型")
@@ -113,6 +125,7 @@ func (s *Slaver) deleteProcessingTask(id int) {
 	defer s.lock.Unlock()
 	for i, _ := range s.ProcessingTasks {
 		if s.ProcessingTasks[i].TaskMeta.TaskId == id {
+			fmt.Printf("从执行中列表删除taskId=%d\n", id)
 			s.ProcessingTasks = append(s.ProcessingTasks[0:i], s.ProcessingTasks[i+1:]...)
 		}
 	}
@@ -121,6 +134,7 @@ func (s *Slaver) deleteProcessingTask(id int) {
 func (s *Slaver) addProcessingTask(task *Task) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
+	fmt.Printf("将任务添加至执行中列表，taskId=%d,slaverName=%s\n", task.TaskMeta.TaskId, s.SlaverName)
 	s.ProcessingTasks = append(s.ProcessingTasks, task)
 }
 
@@ -131,7 +145,9 @@ func (s *Slaver) moveTaskToCompletedTask(id int) {
 	for i, _ := range s.ProcessingTasks {
 		if s.ProcessingTasks[i].TaskMeta.TaskId == id {
 			task = s.ProcessingTasks[i]
+			fmt.Printf("将任务迁移值已完成列表taskId=%d\n", task.TaskMeta.TaskId)
 			s.ProcessingTasks = append(s.ProcessingTasks[0:i], s.ProcessingTasks[i+1:]...)
+			break
 		}
 	}
 	if task == nil {
@@ -159,7 +175,7 @@ func (s *Slaver) realExecuteMapTask(task *Task) {
 	//fmt.Println("realExecuteMapTask")
 	defer func() {
 		if err := recover(); err != nil {
-			fmt.Println(err)
+			fmt.Println("执行map异常")
 			// 调用处理master处理失败接口
 			task.TaskMeta.TaskState = FAILED
 			args := &TaskProcessInfo{
@@ -184,19 +200,25 @@ func (s *Slaver) realExecuteMapTask(task *Task) {
 		}
 		file.Close()
 		kva := s.mapf(filename, string(content))
+		fmt.Printf("{%s}Map处理文件：%s\n", s.SlaverName, task.TaskData[i].Str)
 		// 将hash kv
 		for i, _ := range kva {
 			kv := kva[i]
 			// todo 由master指定分片数
 			idx := ihash(kv.Key) % task.TaskMeta.PieceNum
+			if kv.Key == "AGREE" {
+				fmt.Printf("{%s}命中Agree,%s，idx=%d\n", s.SlaverName, kv.Value, idx)
+			}
 			if s.intermediate == nil {
 				fmt.Printf("task.TaskMeta.PieceNum=%d\n", task.TaskMeta.PieceNum)
 				s.intermediate = make([][]KeyValue, task.TaskMeta.PieceNum)
 			}
+			//fmt.Printf("分片索引:%d\n", idx)
 			kvs := s.intermediate[idx]
 			kvs = append(kvs, kv)
 			s.intermediate[idx] = kvs
 		}
+		fmt.Printf("{%s}执行map成功:%s\n", s.SlaverName, task.TaskData[i].Str)
 	}
 	// 通知Master任务执行成功
 	task.TaskMeta.TaskState = COMPLETE
@@ -210,8 +232,8 @@ func (s *Slaver) realExecuteMapTask(task *Task) {
 
 // 执行reduce任务
 func (s *Slaver) realExecuteReduceTask(task *Task) {
-	fmt.Println("realExecuteReduceTask")
 	defer func() {
+		fmt.Printf("realExecuteReduceTask执行完成taskId=%d\n", task.TaskMeta.TaskId)
 		if err := recover(); err != nil {
 			fmt.Printf("执行报错，err=%v\n", err)
 			// 调用处理master处理失败接口
@@ -229,7 +251,6 @@ func (s *Slaver) realExecuteReduceTask(task *Task) {
 			call(MASTER_TASK_FEIL, args, reply)
 		}
 	}()
-	fmt.Printf("reduce任务执行，%v", *task.TaskData[0])
 	oname := fmt.Sprintf("mr-out-%d", task.TaskData[0].Nu)
 	fmt.Printf("输出文件：%s\n", oname)
 	ofile, _ := os.Create(oname)
@@ -238,18 +259,24 @@ func (s *Slaver) realExecuteReduceTask(task *Task) {
 		ofile.Sync()
 		ofile.Close()
 	}()
+	fmt.Printf("reduce任务执行，task_id=%d\n", task.TaskMeta.TaskId)
 	kvs, failReason := s.fetchIntermediateKv(task.TaskData[0].Nu, task.Slavers)
 	if failReason == SUCCESS {
 		kvalues := make(map[string][]string, 0)
 		for i, _ := range kvs {
 			k := kvs[i].Key
-			kvalues[k] = append(kvalues[k], kvs[i].Key)
+			kvalues[k] = append(kvalues[k], kvs[i].Value)
 		}
+		fmt.Printf("{%d}reduce执行开始==value=%v\n", task.TaskMeta.TaskId, kvs)
 		for k, _ := range kvalues {
-			fmt.Printf("开始执行%s\n", k)
+			//fmt.Printf("开始执行%s，piece=%d\n", k, task.TaskData[0].Nu)
+			if k == "AGREE" {
+				fmt.Printf("Reduce命中Agree,%s，key=%v\n", k, kvalues)
+			}
 			resultStr := s.reducef(k, kvalues[k])
 			fmt.Fprintf(ofile, "%v %v\n", k, resultStr)
 		}
+		fmt.Printf("{%d}reduce执行完成==value=%v\n", task.TaskMeta.TaskId, kvs)
 		// 通知Master任务执行成功
 		task.TaskMeta.TaskState = COMPLETE
 		args := &TaskProcessInfo{
@@ -263,6 +290,7 @@ func (s *Slaver) realExecuteReduceTask(task *Task) {
 
 	} else {
 		// 调用处理master处理失败接口
+		fmt.Printf("fetch数据失败，pause任务，taskId=%d\n", task.TaskMeta.TaskId)
 		task.TaskMeta.TaskState = FAILED
 		taskFailInfo := &TaskFailInfo{
 			PieceIndex: task.TaskData[0].Nu,
@@ -286,6 +314,7 @@ func (s *Slaver) popTaskToReadyTask(taskId int) *Task {
 	for i, _ := range s.ProcessingTasks {
 		if s.ProcessingTasks[i].TaskMeta.TaskId == taskId {
 			task = s.ProcessingTasks[i]
+			fmt.Printf("将任务状态变更为待执行taskId=%d\n", task.TaskMeta.TaskId)
 			s.ProcessingTasks = append(s.ProcessingTasks[0:i], s.ProcessingTasks[i+1:]...)
 		}
 	}
@@ -328,7 +357,7 @@ func (s *Slaver) FetchMapResult(args *FetchMapResultArgs, reply *FetchMapResultR
 	if pieceIdx < len(s.intermediate) {
 		reply.Kvs = s.intermediate[pieceIdx]
 	}
-	fmt.Printf("Map返回的kvs：%v\n", reply.Kvs)
+	//fmt.Printf("Map返回的kvs：%v\n", reply.Kvs)
 	return nil
 }
 
@@ -341,17 +370,20 @@ func (s *Slaver) UnPauseReduce(args *UnPauseArgs, reply *UnPauseReply) error {
 }
 
 func (s *Slaver) fetchIntermediateKv(pieceIdx int, slaverList []*Slaver) ([]KeyValue, TaskFailReason) {
+	resultList := make([]KeyValue, 0)
 	for _, slaver := range slaverList {
+		//fmt.Printf("开始拉数,%s,%d\n", slaver.SlaverName, pieceIdx)
 		args := &FetchMapResultArgs{PieceIdx: pieceIdx}
 		reply := &FetchMapResultReply{}
 		ok := callWorker(slaver.SlaverName, SLAVER_FETCH_MAP_RESULT, args, reply)
 		if ok {
-			return reply.Kvs, SUCCESS
+			resultList = append(resultList, reply.Kvs...)
 		} else {
 			return nil, MAP_CRASH
 		}
 	}
-	return nil, SUCCESS
+	//fmt.Printf("{%s}Reduce拉取数据：%d,pieceNum=%d\n", s.SlaverName, resultList, pieceIdx)
+	return resultList, SUCCESS
 }
 
 func generateName() string {
@@ -372,6 +404,7 @@ func (s *Slaver) startHeartBeat() {
 	for {
 		select {
 		case <-time.NewTicker(time.Duration(1) * time.Second).C:
+			//fmt.Printf("slaver心跳,%s\n", s.SlaverName)
 			args := &HeartBeatArgs{Name: s.SlaverName}
 			s.callHeartBeat(args)
 		}
@@ -443,27 +476,40 @@ func callWorker(workerName string, rpcname string, args interface{}, reply inter
 }
 
 //==========测试=======
-func Map(filename string, contents string) []KeyValue {
-	// function to detect word separators.
-	ff := func(r rune) bool { return !unicode.IsLetter(r) }
+func maybeCrash() {
+	max := big.NewInt(1000)
+	os.Exit(1)
+	rr, _ := crand.Int(crand.Reader, max)
+	if rr.Int64() < 330 {
+		// crash!
+	} else if rr.Int64() < 660 {
+		os.Exit(1)
+		// delay for a while.
+		maxms := big.NewInt(10 * 1000)
+		ms, _ := crand.Int(crand.Reader, maxms)
+		time.Sleep(time.Duration(ms.Int64()) * time.Millisecond)
+	}
+}
 
-	// split contents into an array of words.
-	words := strings.FieldsFunc(contents, ff)
+func Map(filename string, contents string) []KeyValue {
+	maybeCrash()
 
 	kva := []KeyValue{}
-	for _, w := range words {
-		kv := KeyValue{w, "1"}
-		kva = append(kva, kv)
-	}
+	kva = append(kva, KeyValue{"a", filename})
+	kva = append(kva, KeyValue{"b", strconv.Itoa(len(filename))})
+	kva = append(kva, KeyValue{"c", strconv.Itoa(len(contents))})
+	kva = append(kva, KeyValue{"d", "xyzzy"})
 	return kva
 }
 
-//
-// The reduce function is called once for each key generated by the
-// map tasks, with a list of all the values created for that key by
-// any map task.
-//
 func Reduce(key string, values []string) string {
-	// return the number of occurrences of this word.
-	return strconv.Itoa(len(values))
+	maybeCrash()
+
+	// sort values to ensure deterministic output.
+	vv := make([]string, len(values))
+	copy(vv, values)
+	sort.Strings(vv)
+
+	val := strings.Join(vv, " ")
+	return val
 }
