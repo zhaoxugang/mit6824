@@ -340,6 +340,7 @@ func (cfg *config) checkTerms() int {
 			if term == -1 {
 				term = xterm
 			} else if term != xterm {
+				DPrintf("term校验失败，%v,%v,%v", i, term, xterm)
 				cfg.t.Fatalf("servers disagree on term")
 			}
 		}

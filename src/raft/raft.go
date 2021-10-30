@@ -17,7 +17,12 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"time"
+)
 import "sync/atomic"
 import "mit6824/src/labrpc"
 
@@ -41,6 +46,18 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+// raft节点状态
+type RaftState uint8
+
+const (
+	FOLLOWER RaftState = iota
+	CANDIDATE
+	LEADER
+)
+
+// raft Leader心跳间隔
+const BEAT_HEART_INTERVAL = 200
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -55,16 +72,20 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	state RaftState
+	term  int
+	// 单位是秒
+	lastLeaderAct int64
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// Your code here (2A).
-	return term, isleader
+	//DPrintf("{%d}GetState:%v--%v", rf.me, rf.term, rf.state)
+	return rf.term, rf.state == LEADER
 }
 
 //
@@ -105,12 +126,27 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     string
+	PrevLogIndex uint64
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  string
+	LastLogIndex uint64
+	LastLogTerm  uint64
 }
 
 //
@@ -119,6 +155,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -126,6 +164,58 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer func() {
+		DPrintf("{%d，%d, %d}投票：%v-%v", rf.me, rf.term, rf.state, args.Term, reply)
+		rf.mu.Unlock()
+	}()
+	switch rf.state {
+	case FOLLOWER:
+		if args.Term <= rf.term {
+			reply.VoteGranted = false
+			reply.Term = rf.term
+			return
+		} else {
+			reply.VoteGranted = true
+			reply.Term = args.Term
+		}
+	case CANDIDATE:
+		if args.Term <= rf.term {
+			reply.Term = rf.term
+			reply.VoteGranted = false
+		} else {
+			rf.setStateWithConditionUnLock(CANDIDATE, FOLLOWER)
+			reply.Term = args.Term
+			reply.VoteGranted = true
+		}
+	case LEADER:
+		if args.Term <= rf.term {
+			reply.VoteGranted = false
+			reply.Term = rf.term
+		} else {
+			rf.setStateWithConditionUnLock(LEADER, FOLLOWER)
+			reply.Term = args.Term
+			reply.VoteGranted = true
+		}
+	}
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//DPrintf("{%d}心跳", rf.me)
+	if args.Term < rf.term {
+		reply.Term = rf.term
+		reply.Success = false
+		return
+	}
+	rf.lastLeaderAct = time.Now().UnixNano() / 1e6
+	if rf.term < args.Term {
+		rf.term = args.Term
+	}
+	reply.Term = args.Term
+	reply.Success = true
+	return
 }
 
 //
@@ -186,6 +276,50 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+func (rf *Raft) checkLeaderAlive() {
+	for {
+		select {
+		case <-time.NewTicker(BEAT_HEART_INTERVAL * time.Millisecond).C:
+			for rf.state != LEADER && time.Now().UnixNano()/1e6 > rf.lastLeaderAct+2*BEAT_HEART_INTERVAL {
+				DPrintf("Leader凉凉")
+				// leader 已死
+				time.Sleep(time.Duration(650+rand.Intn(300)) * time.Millisecond)
+				rf.setStateWithCondition(FOLLOWER, CANDIDATE)
+				if !rf.addTerm() {
+					break
+				}
+
+				DPrintf("{%d}开始选举,%d", rf.me, rf.term)
+				var ok bool
+				var maxTerm int
+				ok, maxTerm = rf.requireVotes()
+				DPrintf("{%d}选票结果，ok=%v,maxTerm=%v", rf.me, ok, maxTerm)
+				if ok {
+					// 通知其他节点选主成功
+					ok, maxTerm = rf.noticeLeaderElectionSuccess()
+					DPrintf("通知其他节点选主完成%v,%v", ok, maxTerm)
+					if ok {
+						// 超过半数同意
+						if rf.setStateWithCondition(CANDIDATE, LEADER) {
+							DPrintf("%d成为Leader", rf.me)
+							go rf.maintainLeaderAuthority()
+							break
+						}
+					} else {
+						// 为了下次选主做准备，如果不同步则下次投票只能做follower
+						rf.syncMaxTerm(maxTerm)
+					}
+				} else {
+					// 为了下次选主做准备，如果不同步则下次投票只能做follower
+					rf.syncMaxTerm(maxTerm)
+				}
+				// 如果节点状态为candidate则转为follower
+				rf.setStateWithCondition(CANDIDATE, FOLLOWER)
+			}
+		}
+	}
+}
+
 //
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
@@ -205,6 +339,161 @@ func (rf *Raft) Kill() {
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
+}
+
+func (rf *Raft) setStateWithCondition(condition RaftState, state RaftState) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state == state {
+		return true
+	}
+	if rf.state == condition {
+		rf.state = state
+		return true
+	}
+	return false
+}
+
+func (rf *Raft) setStateWithConditionUnLock(condition RaftState, state RaftState) bool {
+	if rf.state == state {
+		return true
+	}
+	if rf.state == condition {
+		rf.state = state
+		return true
+	}
+	return false
+}
+
+func (rf *Raft) requireVotes() (bool, int) {
+	// 先投自己一票
+	voteGrantedCount := 1
+	maxTerm := rf.term
+	lock := sync.Mutex{}
+	done := make(chan struct{}, 10)
+	remain := len(rf.peers) - 1
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(peer int) {
+			defer func() {
+				done <- struct{}{}
+			}()
+			args := &RequestVoteArgs{
+				Term:        rf.term,
+				CandidateId: fmt.Sprintf("%d", rf.me),
+			}
+			reply := &RequestVoteReply{}
+			ok := rf.sendRequestVote(peer, args, reply)
+			if ok && reply.VoteGranted {
+				lock.Lock()
+				defer lock.Unlock()
+				if reply.Term > maxTerm {
+					maxTerm = reply.Term
+				}
+				voteGrantedCount++
+			}
+		}(i)
+	}
+	for remain > 0 {
+		select {
+		case <-done:
+			remain--
+		case <-time.NewTicker(50 * time.Millisecond).C:
+			remain = 0
+		}
+	}
+	if rf.term >= maxTerm && voteGrantedCount > len(rf.peers)/2 {
+		return true, rf.term
+	}
+	return false, maxTerm
+}
+
+func (rf *Raft) addTerm() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if time.Now().UnixNano()/1e6 <= rf.lastLeaderAct+2*BEAT_HEART_INTERVAL || rf.state != CANDIDATE {
+		DPrintf("{%d}状态：%d", rf.me, rf.state)
+		return false
+	}
+	rf.term = rf.term + 1
+	return true
+}
+
+func (rf *Raft) noticeLeaderElectionSuccess() (bool, int) {
+	maxTerm := rf.term
+	lock := sync.Mutex{}
+	remain := len(rf.peers) - 1
+	done := make(chan struct{}, 10)
+	replayCount := 1
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(peer int) {
+			defer func() {
+				done <- struct{}{}
+			}()
+			args := &AppendEntriesArgs{
+				Term:     rf.term,
+				LeaderId: fmt.Sprintf("%d", rf.me),
+			}
+			reply := &AppendEntriesReply{}
+			ok := rf.sendAppendEntries(peer, args, reply)
+			if ok && reply.Success {
+				lock.Lock()
+				defer lock.Unlock()
+				if reply.Term > maxTerm {
+					maxTerm = reply.Term
+				}
+			}
+		}(i)
+	}
+	for remain > 0 {
+		select {
+		case <-done:
+			remain--
+			replayCount++
+		case <-time.NewTicker(50 * time.Millisecond).C:
+			remain = 0
+		}
+	}
+	if replayCount > len(rf.peers)/2 && rf.term >= maxTerm {
+		return true, rf.term
+	}
+	return false, maxTerm
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) syncMaxTerm(term int) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.term < term {
+		rf.term = term
+		return true
+	}
+	return false
+}
+
+func (rf *Raft) maintainLeaderAuthority() {
+	for rf.state == LEADER {
+		select {
+		case <-time.NewTicker(BEAT_HEART_INTERVAL * time.Millisecond).C:
+			//DPrintf("发送心跳")
+			// 通知其他节点选主成功
+			ok, _ := rf.noticeLeaderElectionSuccess()
+			//DPrintf("{%d}, 心跳，ok=%v", rf.me, ok)
+			if !ok {
+				// 不改变term，被请求投票是在增加
+				rf.setStateWithCondition(LEADER, FOLLOWER)
+			}
+		}
+	}
 }
 
 //
@@ -229,6 +518,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	go rf.checkLeaderAlive()
 	return rf
 }
