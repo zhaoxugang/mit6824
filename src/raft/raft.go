@@ -58,6 +58,8 @@ const (
 // raft Leader心跳间隔
 const BEAT_HEART_INTERVAL = 200
 
+const LEASE_INTERVAL = 3 * BEAT_HEART_INTERVAL
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -86,6 +88,8 @@ type Raft struct {
 	// The leader maintains a nextIndex for each follower,
 	// which is the index of the next log entry the leader will send to that follower.
 	nextCommitIndexOfPeer []int
+	// 租约，为解决假主问题
+	leaseLastUpdateTm int64
 }
 
 // return currentTerm and whether this server
@@ -189,6 +193,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer func() {
 		//DPrintf("{%d，%d, %d}投票：%v-%v", rf.me, rf.term, rf.state, args.Term, reply)
+		if rf.term < args.Term {
+			rf.term = args.Term
+		}
 		rf.mu.Unlock()
 	}()
 	lastLogIndex := 0
@@ -366,6 +373,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	// 如果不是Leader则直接返回
 	if !isLeader {
+		DPrintf("{%d}不是leader-start-%v", rf.me, command)
 		isLeader = false
 		return index, term, isLeader
 	}
@@ -396,19 +404,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 		DPrintf("{%d} leader apply log %d", rf.me, rf.logIndex)
 		rf.commitIndex = rf.logIndex
-		for i, _ := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			args := &AppendEntriesArgs{
-				LeaderLogIndex: rf.commitIndex,
-				AppendEntry:    false,
-				Term:           rf.term,
-				LeaderId:       fmt.Sprintf("%d", rf.me),
-			}
-			reply := &AppendEntriesReply{}
-			rf.sendAppendEntries(i, args, reply)
-		}
+		//for i, _ := range rf.peers {
+		//	if i == rf.me {
+		//		continue
+		//	}
+		//	args := &AppendEntriesArgs{
+		//		LeaderLogIndex: rf.commitIndex,
+		//		AppendEntry:    false,
+		//		Term:           rf.term,
+		//		LeaderId:       fmt.Sprintf("%d", rf.me),
+		//	}
+		//	reply := &AppendEntriesReply{}
+		//	//DPrintf("rpc4")
+		//	rf.sendAppendEntries(i, args, reply)
+		//}
 	}
 	if term > rf.term {
 		rf.setStateWithCondition(LEADER, FOLLOWER)
@@ -421,8 +430,8 @@ func (rf *Raft) checkLeaderAlive() {
 	for {
 		select {
 		case <-time.NewTicker(BEAT_HEART_INTERVAL * time.Millisecond).C:
-			for rf.state != LEADER && time.Now().UnixNano()/1e6 > rf.lastLeaderAct+2*BEAT_HEART_INTERVAL {
-				//DPrintf("{%d}Leader凉凉", rf.me)
+			for rf.state != LEADER && time.Now().UnixNano()/1e6 > rf.lastLeaderAct+4*BEAT_HEART_INTERVAL {
+				DPrintf("{%d}Leader凉凉", rf.me)
 				// leader 已死
 				time.Sleep(time.Duration(650+rand.Intn(300)) * time.Millisecond)
 				rf.setStateWithCondition(FOLLOWER, CANDIDATE)
@@ -434,7 +443,7 @@ func (rf *Raft) checkLeaderAlive() {
 				var ok bool
 				var maxTerm int
 				ok, maxTerm = rf.requireVotes()
-				//DPrintf("{%d}选票结果，ok=%v,maxTerm=%v", rf.me, ok, maxTerm)
+				DPrintf("{%d}选票结果，curTerm=%d,ok=%v,maxTerm=%v", rf.me, rf.term, ok, maxTerm)
 				if ok {
 					// 通知其他节点选主成功
 					ok, maxTerm = rf.noticeLeaderElectionSuccess()
@@ -532,7 +541,7 @@ func (rf *Raft) requireVotes() (bool, int) {
 			}
 			reply := &RequestVoteReply{}
 			ok := rf.sendRequestVote(peer, args, reply)
-			//DPrintf("{%d}请求投票{%d}，ok=%t, reply=%v", rf.me, peer, ok, reply)
+			DPrintf("{%d}请求投票{%d}，ok=%t, args.term=%v, reply=%v", rf.me, peer, ok, args.Term, reply)
 			if ok && reply.VoteGranted {
 				lock.Lock()
 				defer lock.Unlock()
@@ -547,14 +556,14 @@ func (rf *Raft) requireVotes() (bool, int) {
 		select {
 		case <-done:
 			remain--
-		case <-time.NewTicker(50 * time.Millisecond).C:
+		case <-time.NewTicker(100 * time.Millisecond).C:
 			remain = 0
 		}
 	}
 	if rf.term >= maxTerm && voteGrantedCount > len(rf.peers)/2 {
 		return true, rf.term
 	}
-	//DPrintf("{%d}获得选票数：%d", rf.me, voteGrantedCount)
+	DPrintf("{%d}获得选票数：%d", rf.me, voteGrantedCount)
 	return false, maxTerm
 }
 
@@ -755,9 +764,9 @@ func (rf *Raft) commitLogEntry() (bool, int) {
 		case <-done:
 			remain--
 		case <-time.NewTicker(50 * time.Millisecond).C:
-			if replayCount > len(rf.peers)/2 {
-				remain = 0
-			}
+			// 超时
+			DPrintf("appendEntries超时，logindex=%d", rf.logIndex)
+			remain = 0
 		}
 	}
 	if replayCount > len(rf.peers)/2 {
