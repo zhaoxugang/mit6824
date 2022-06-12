@@ -468,7 +468,7 @@ func (rf *Raft) consumeCommitEvent() {
 
 func (rf *Raft) checkLease() {
 	if rf.isLeader() {
-		now := time.Now().UnixNano() / 1e6
+		now := time.Now().UnixMilli()
 		threshold := now - LEASE_INTERVAL
 		aliveCount := 0
 		for idx, _ := range rf.lastRespTimePeers {
@@ -478,14 +478,8 @@ func (rf *Raft) checkLease() {
 			}
 		}
 		// DPrintf("{%d}checkLease，aliveCount=%d", rf.me, aliveCount)
-		if aliveCount <= len(rf.peers)/2 && rf.checkLeaseCount > 4 {
-
+		if aliveCount <= len(rf.peers)/2 {
 			rf.setStateWithCondition(LEADER, FOLLOWER)
-		}
-		if aliveCount > len(rf.peers)/2 {
-			rf.checkLeaseCount = 0
-		} else {
-			rf.checkLeaseCount++
 		}
 	}
 }
@@ -504,7 +498,7 @@ func (rf *Raft) checkLeaderAlive() {
 					break
 				}
 
-				//DPrintf("{%d}开始选举,%d", rf.me, rf.term)
+				DPrintf("{%d}开始选举,%d", rf.me, rf.term)
 				var ok bool
 				var maxTerm int
 				ok, maxTerm = rf.requireVotes()
@@ -761,6 +755,7 @@ func (rf *Raft) maintainLeaderAuthority() {
 					rf.lastRespTimePeers[peer] = now.UnixNano() / 1e6
 				}
 				time.Sleep(BEAT_HEART_INTERVAL * time.Millisecond)
+				rf.checkLease()
 			}
 		}(i)
 	}
