@@ -291,7 +291,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	DPrintf("{%d}RequestVote args=%v, rf.term=%d,lastLogIndex=%d,lastLogTerm=%d", rf.me, args, rf.term, lastLogIndex, lastLogTerm)
 	switch rf.state {
 	case FOLLOWER:
-		if args.Term <= rf.term || args.LastLogTerm < lastLogTerm ||
+		if args.Term < rf.term || args.LastLogTerm < lastLogTerm ||
 			(args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
 			reply.Desc = fmt.Sprintf("我是FOLLOWER,%d,%d,%d,%d,%d,%d,%d,%d", args.Term, rf.term, args.LastLogTerm, lastLogTerm,
 				args.LastLogTerm, lastLogTerm, args.LastLogIndex, lastLogIndex)
@@ -303,7 +303,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = args.Term
 		}
 	case CANDIDATE:
-		if args.Term <= rf.term || args.LastLogTerm < lastLogTerm ||
+		if args.Term < rf.term || args.LastLogTerm < lastLogTerm ||
 			(args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
 			reply.Term = rf.term
 			reply.Desc = "我是CANDIDATE"
@@ -314,7 +314,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 		}
 	case LEADER:
-		if args.Term <= rf.term || args.LastLogTerm < lastLogTerm ||
+		if args.Term < rf.term || args.LastLogTerm < lastLogTerm ||
 			(args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
 			reply.Desc = "我是LEADER"
 			reply.VoteGranted = false
