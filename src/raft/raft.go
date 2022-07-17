@@ -106,6 +106,9 @@ type Raft struct {
 
 	commitEventChan   chan CommitEvent
 	commitIndexOfPeer []int
+	// 记住投票的term及peer
+	grantTerm int
+	grantPeer int
 }
 
 // return currentTerm and whether this server
@@ -180,9 +183,9 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 type LogEntry struct {
-	Command  interface{} `command`
-	LogIndex int         `logIndex`
-	Term     int         `term`
+	Command  interface{} `json:"command"`
+	LogIndex int         `json:"log_index"`
+	Term     int         `json:"term"`
 }
 
 type AppendEntriesArgs struct {
@@ -191,7 +194,7 @@ type AppendEntriesArgs struct {
 	PrevLogIndex int         `json:"prev_log_index"`
 	PrevLogTerm  int         `json:"prev_log_term"`
 	Entries      []*LogEntry `json:"entries"`
-	RequestType  requestType `json:"append_entry"`
+	RequestType  requestType `json:"request_type"`
 	CommitIndex  int         `json:"commit_index"`
 	AppendIndex  int         `json:"append_index"`
 	Peer         int         `json:"peer"`
@@ -219,10 +222,10 @@ const (
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         int    `json:"term"`
-	CandidateId  string `json:"candidate_id"`
-	LastLogIndex int    `json:"last_log_index"`
-	LastLogTerm  int    `json:"last_log_term"`
+	Term         int `json:"term"`
+	CandidateId  int `json:"candidate_id"`
+	LastLogIndex int `json:"last_log_index"`
+	LastLogTerm  int `json:"last_log_term"`
 }
 
 //
@@ -242,6 +245,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
+	DPrintf("{%d}RequestVote args=%v, rf.term=%d", rf.me, args, rf.term)
 	defer func() {
 		// DPrintf("选举{%d，%d, %d}投票：%v-%v", rf.me, rf.term, rf.state, args.Term, reply)
 		if rf.term < args.Term {
@@ -253,6 +257,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		if reply.VoteGranted {
 			rf.lastLeaderAct = time.Now().UnixMilli()
+			rf.grantPeer = args.CandidateId
+			rf.grantTerm = args.Term
 		}
 		rf.mu.Unlock()
 	}()
@@ -264,13 +270,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		return
 	}
+	if args.Term == rf.term && rf.grantTerm == args.Term {
+		if rf.grantPeer != args.CandidateId {
+			reply.VoteGranted = false
+			reply.Term = rf.term
+			DPrintf("{%d}直接投票失败， args=%s", rf.me, getJson(args))
+		} else {
+			reply.VoteGranted = true
+			reply.Term = rf.term
+			DPrintf("{%d}直接投票成功， args=%s", rf.me, getJson(args))
+		}
+		return
+	}
 	lastLogIndex := 0
 	lastLogTerm := 0
 	if len(rf.logEntrys) > 0 {
 		lastLogIndex = rf.logEntrys[len(rf.logEntrys)-1].LogIndex
 		lastLogTerm = rf.logEntrys[len(rf.logEntrys)-1].Term
 	}
-	// DPrintf("{%d}args=%v, rf.term=%d,lastLogIndex=%d,lastLogTerm=%d", rf.me, args, rf.term, lastLogIndex, lastLogTerm)
+	DPrintf("{%d}RequestVote args=%v, rf.term=%d,lastLogIndex=%d,lastLogTerm=%d", rf.me, args, rf.term, lastLogIndex, lastLogTerm)
 	switch rf.state {
 	case FOLLOWER:
 		if args.Term <= rf.term || args.LastLogTerm < lastLogTerm ||
@@ -516,13 +534,22 @@ func (rf *Raft) Start(command interface{}) (index, term int, isLeader bool) {
 	if appendResult.Success {
 		DPrintf("%d append Over!!!,%v,%d,%t,%d,%d,Desc=%s,isLeader=%t", rf.me, command, logEntry.LogIndex, appendResult.Success, appendResult.MaxTerm, rf.term, appendResult.Desc, rf.isLeader())
 
-		commitEvent := CommitEvent{
-			commitResultChan: make(chan *CommitResult, 1),
-			logIndex:         logEntry.LogIndex,
-			peer:             rf.me,
+		offset, exists := rf.findLogEntryByIndex(rf.commitIndex + 1)
+		if exists {
+			for i := offset; i < len(rf.logEntrys) && rf.logEntrys[i].LogIndex <= logEntry.LogIndex; i++ {
+				commitLog := rf.logEntrys[i]
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      commitLog.Command,
+					CommandIndex: commitLog.LogIndex,
+				}
+				DPrintf("{%d} leader apply log %d,%v", rf.me, commitLog.LogIndex, commitLog.Command)
+				rf.commitIndex = commitLog.LogIndex
+				// fmt.Printf("{%d}Leader apply {%d},cmd={%v},%d\n", rf.me, commitLog.LogIndex, commitLog.Command, commitLog.Term)
+			}
 		}
-		rf.commitEventChan <- commitEvent
-		<-commitEvent.commitResultChan
+	} else {
+		rf.setStateWithCondition(LEADER, FOLLOWER, 4)
 	}
 	DPrintf("{%d}==========%d,%v,%t", rf.me, logEntry.LogIndex, command, isLeader)
 	return logEntry.LogIndex, rf.term, isLeader
@@ -552,20 +579,6 @@ func (rf *Raft) consumeCommitEvent() {
 				DPrintf("{%d}commit START,commitEvent.logIndex=%d, peer=%d", rf.me, commitEvent.logIndex, commitEvent.peer)
 				commitSuccess := rf.commitLogEntries(commitEvent.logIndex, commitEvent.peer)
 				DPrintf("commitSuccess=%t,commitEvent.logIndex=%d", commitSuccess, commitEvent.logIndex)
-				offset, exists := rf.findLogEntryByIndex(rf.commitIndex + 1)
-				if commitEvent.peer == rf.me && commitSuccess && exists {
-					for i := offset; i < len(rf.logEntrys) && rf.logEntrys[i].LogIndex <= commitEvent.logIndex; i++ {
-						commitLog := rf.logEntrys[i]
-						rf.applyCh <- ApplyMsg{
-							CommandValid: true,
-							Command:      commitLog.Command,
-							CommandIndex: commitLog.LogIndex,
-						}
-						DPrintf("{%d} leader apply log %d,%v", rf.me, commitLog.LogIndex, commitLog.Command)
-						rf.commitIndex = commitLog.LogIndex
-						// fmt.Printf("{%d}Leader apply {%d},cmd={%v},%d\n", rf.me, commitLog.LogIndex, commitLog.Command, commitLog.Term)
-					}
-				}
 				commitEvent.commitResultChan <- &CommitResult{
 					success: true,
 				}
@@ -711,7 +724,7 @@ func (rf *Raft) requireVotes() (bool, int) {
 			}()
 			args := &RequestVoteArgs{
 				Term:        rf.term,
-				CandidateId: fmt.Sprintf("%d", rf.me),
+				CandidateId: rf.me,
 			}
 			if len(rf.logEntrys) > 0 {
 				lastLogEntry := rf.logEntrys[len(rf.logEntrys)-1]
@@ -832,6 +845,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			done := make(chan struct{}, 1)
 			var ok bool
 			go func() {
+				DPrintf("rpc-count, args=%s", getJson(args))
 				ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
 				done <- struct{}{}
 			}()
